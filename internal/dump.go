@@ -2,16 +2,24 @@ package internal
 
 import (
 	"fmt"
-	spb "google.golang.org/genproto/googleapis/rpc/status"
+	"time"
+
 	"google.golang.org/grpc/metadata"
 )
 
 type RPC struct {
-	Service  string         `json:"service"`
-	Method   string         `json:"method"`
-	Messages []*StreamEvent `json:"messages"`
-	Status   *spb.Status    `json:"error,omitempty"`
-	Metadata metadata.MD    `json:"metadata"`
+	Service              string      `json:"service"`
+	Method               string      `json:"method"`
+	Messages             []*Message  `json:"messages"`
+	Status               *Status     `json:"error,omitempty"`
+	Metadata             metadata.MD `json:"metadata"`
+	MetadataRespHeaders  metadata.MD `json:"metadata_response_headers"`
+	MetadataRespTrailers metadata.MD `json:"metadata_response_trailers"`
+}
+
+type Status struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 func (r RPC) StreamName() string {
@@ -25,8 +33,9 @@ const (
 	ServerMessage MessageOrigin = "server"
 )
 
-type StreamEvent struct {
+type Message struct {
 	MessageOrigin MessageOrigin `json:"message_origin,omitempty"`
-	RawMessage    []byte        `json:"raw_message,omitempty"`
+	RawMessage    []byte        `json:"raw_message"`
 	Message       interface{}   `json:"message,omitempty"`
+	Timestamp     time.Time     `json:"timestamp"`
 }

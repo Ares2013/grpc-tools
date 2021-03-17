@@ -1,18 +1,25 @@
 package grpc_proxy
 
 import (
-	"github.com/bradleyjkemp/grpc-tools/internal/marker"
-	"github.com/improbable-eng/grpc-web/go/grpcweb"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
+
+	"github.com/bradleyjkemp/grpc-tools/internal/marker"
+
+	"github.com/sirupsen/logrus"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
-func newHttpServer(logger logrus.FieldLogger, grpcHandler *grpcweb.WrappedGrpcServer, internalRedirect func(net.Conn, string)) *http.Server {
+type grpcWebServer interface {
+	ServeHTTP(resp http.ResponseWriter, req *http.Request)
+	IsGrpcWebRequest(req *http.Request) bool
+}
+
+func newHttpServer(logger logrus.FieldLogger, grpcHandler grpcWebServer, internalRedirect func(net.Conn, string), reverseProxy http.Handler) *http.Server {
 	return &http.Server{
 		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
@@ -34,7 +41,7 @@ func newHttpServer(logger logrus.FieldLogger, grpcHandler *grpcweb.WrappedGrpcSe
 				// so must try to be as transparent as possible for normal
 				// HTTP requests by proxying the request to the original destination.
 				logger.Debugf("Reverse proxying HTTP request %s %s %s", r.Method, r.Host, r.URL)
-				httpReverseProxy.ServeHTTP(w, r)
+				reverseProxy.ServeHTTP(w, r)
 			}
 		}), &http2.Server{}),
 	}
@@ -51,27 +58,38 @@ func handleConnect(w http.ResponseWriter, r *http.Request, internalRedirect func
 		// TODO: log error here
 		return
 	}
-	clientConn.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
-	internalRedirect(clientConn, r.Host)
+	_, err = fmt.Fprintf(clientConn, "%s 200 OK\r\n\r\n", r.Proto)
+	if err == nil {
+		internalRedirect(clientConn, r.Host)
+	} else {
+		_ = clientConn.Close()
+	}
 }
 
-var httpReverseProxy = &httputil.ReverseProxy{
-	Director: func(request *http.Request) {
-		// Because of the TLSmux used to server HTTP and HTTPS on the same port
-		// we have to rely on the Forwarded header (added by middleware) to
-		// tell which protocol to use for proxying.
-		// (we could always set HTTP but would mean relying on the upstream
-		// properly redirecting HTTP->HTTPS)
-		if marker.IsTLSRequest(request.Header) {
-			request.URL.Scheme = "https"
-		} else {
-			request.URL.Scheme = "http"
-		}
-		request.URL.Host = request.Host
-	},
+func newReverseProxy(logger logrus.FieldLogger) *httputil.ReverseProxy {
+	logger = logger.WithField("", "http_reverse_proxy")
+	return &httputil.ReverseProxy{
+		Director: func(request *http.Request) {
+			// Because of the TLSmux used to server HTTP and HTTPS on the same port
+			// we have to rely on the Forwarded header (added by middleware) to
+			// tell which protocol to use for proxying.
+			// (we could always set HTTP but would mean relying on the upstream
+			// properly redirecting HTTP->HTTPS)
+			if marker.IsTLSRequest(request.Header) {
+				request.URL.Scheme = "https"
+			} else {
+				request.URL.Scheme = "http"
+			}
+			request.URL.Host = request.Host
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.WithError(err).Debug("http proxy error")
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	}
 }
 
-func isGrpcRequest(server *grpcweb.WrappedGrpcServer, r *http.Request) bool {
+func isGrpcRequest(server grpcWebServer, r *http.Request) bool {
 	return server.IsGrpcWebRequest(r) || // gRPC-Web request from browser
 		r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") // Standard gRPC request
 }

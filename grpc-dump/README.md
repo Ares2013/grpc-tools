@@ -23,6 +23,8 @@ Usage of grpc-dump:
     	A comma separated list of proto descriptors to load gRPC service definitions from.
   -proto_roots string
     	A comma separated list of directories to search for gRPC service definitions.
+  -system_proxy
+    	Automatically configure system to use this as the proxy for all connections.
 ```
 
 ## JSON stream output
@@ -39,6 +41,7 @@ Each message has the format:
   "messages" : [
     {
       "message_origin" : "server|client",
+      "timestamp" : "RFC3339 timestamp",
       "raw_message" : "base64 encoded bytes of the raw protobuf",
       "message" : {
         // The parsed representation of the message
@@ -46,7 +49,7 @@ Each message has the format:
     }
   ],
   "error" : { // present if the gRPC status is not OK
-    "code" : 2,
+    "code" : "Status code string",
     "message" : "the gRPC error message"
   },
   "metadata" : { // the metadata present in the gRPC context

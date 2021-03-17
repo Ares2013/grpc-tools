@@ -1,32 +1,52 @@
 package grpc_proxy
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
 	"github.com/bradleyjkemp/grpc-tools/internal"
 	"github.com/bradleyjkemp/grpc-tools/internal/codec"
 	"github.com/bradleyjkemp/grpc-tools/internal/detectcert"
+	"github.com/bradleyjkemp/grpc-tools/internal/proxy_settings"
+	"github.com/bradleyjkemp/grpc-tools/internal/proxydialer"
 	"github.com/bradleyjkemp/grpc-tools/internal/tlsmux"
 	"github.com/improbable-eng/grpc-web/go/grpcweb"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/net/http/httpproxy"
 	"google.golang.org/grpc"
-	"net"
+	_ "google.golang.org/grpc/encoding/gzip"
 )
+
+type ContextDialer = func(context.Context, string) (net.Conn, error)
 
 type server struct {
 	serverOptions []grpc.ServerOption
 	grpcServer    *grpc.Server
 	logger        logrus.FieldLogger
 
-	port     int
-	certFile string
-	keyFile  string
-	x509Cert *x509.Certificate
-	tlsCert  tls.Certificate
+	networkInterface string
+	port             int
+	certFile         string
+	keyFile          string
+	x509Cert         *x509.Certificate
+	tlsCert          tls.Certificate
 
 	destination string
 	connPool    *internal.ConnPool
+	dialOptions []grpc.DialOption
+	dialer      ContextDialer
+
+	enableSystemProxy bool
+
+	tlsSecretsFile string
 
 	listener net.Listener
 }
@@ -34,8 +54,9 @@ type server struct {
 func New(configurators ...Configurator) (*server, error) {
 	logger := logrus.New()
 	s := &server{
-		connPool: internal.NewConnPool(),
-		logger:   logger,
+		logger:           logger,
+		dialer:           proxydialer.NewProxyDialer(httpproxy.FromEnvironment().ProxyFunc()),
+		networkInterface: "localhost", // default to just localhost if no other interface is chosen
 	}
 	s.serverOptions = []grpc.ServerOption{
 		grpc.CustomCodec(codec.NoopCodec{}),        // Allows for passing raw []byte messages around
@@ -46,13 +67,20 @@ func New(configurators ...Configurator) (*server, error) {
 		configurator(s)
 	}
 
-	level, err := logrus.ParseLevel(fLogLevel)
-	if err != nil {
-		return nil, err
+	// Have to initialise the connpool now because
+	// the dialer may been changed by options
+	s.connPool = internal.NewConnPool(logger, s.dialer)
+
+	if fLogLevel != "" {
+		level, err := logrus.ParseLevel(fLogLevel)
+		if err != nil {
+			return nil, err
+		}
+		logger.SetLevel(level)
 	}
-	logger.SetLevel(level)
 
 	if s.certFile == "" && s.keyFile == "" {
+		var err error
 		s.certFile, s.keyFile, err = detectcert.Detect()
 		if err != nil {
 			s.logger.WithError(err).Info("Failed to detect certificates")
@@ -77,9 +105,9 @@ func New(configurators ...Configurator) (*server, error) {
 
 func (s *server) Start() error {
 	var err error
-	s.listener, err = net.Listen("tcp", fmt.Sprintf("localhost:%d", s.port))
+	s.listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", s.networkInterface, s.port))
 	if err != nil {
-		return fmt.Errorf("failed to listen on port (%d): %v", s.port, err)
+		return fmt.Errorf("failed to listen on interface (%s:%d): %v", s.networkInterface, s.port, err)
 	}
 	s.logger.Infof("Listening on %s", s.listener.Addr())
 	if s.x509Cert != nil {
@@ -95,13 +123,42 @@ func (s *server) Start() error {
 	)
 
 	proxyLis := newProxyListener(s.logger, s.listener)
+	httpReverseProxy := newReverseProxy(s.logger)
+	httpServer := newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, httpReverseProxy)
+	httpsServer := withHttpsMiddleware(newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, httpReverseProxy))
 
-	httpServer := newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect)
-	httpsServer := withHttpsMiddleware(newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect))
+	// Use file path for Master Secrets file is specified. Send to /dev/null if not.
+	keyLogWriter := ioutil.Discard
+	if s.tlsSecretsFile != "" {
+		keyLogWriter, err = os.OpenFile(s.tlsSecretsFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		if err != nil {
+			return fmt.Errorf("failed opening secrets file on path: %s", s.tlsSecretsFile)
+		}
+	}
+	httpLis, httpsLis := tlsmux.New(s.logger, proxyLis, s.x509Cert, s.tlsCert, keyLogWriter)
 
-	httpLis, httpsLis := tlsmux.New(s.logger, proxyLis, s.x509Cert, s.tlsCert)
+	errChan := make(chan error)
+	if s.enableSystemProxy {
+		disableProxy, err := proxy_settings.EnableProxy(s.listener.Addr().String())
+		if err != nil {
+			return errors.Wrap(err, "failed to enable system proxy")
+		}
+		s.logger.Info("Enabled system proxy.")
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigs
+			errChan <- disableProxy()
+		}()
+	}
 
-	// the TLSMux unwraps TLS for us so we use Serve instead of ServeTLS
-	go httpsServer.ServeTLS(httpsLis, s.certFile, s.keyFile)
-	return httpServer.Serve(httpLis)
+	go func() {
+		errChan <- httpServer.Serve(httpLis)
+	}()
+	go func() {
+		// the TLSMux unwraps TLS for us so we use Serve instead of ServeTLS
+		errChan <- httpsServer.Serve(httpsLis)
+	}()
+
+	return <-errChan
 }

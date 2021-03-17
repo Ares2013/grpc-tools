@@ -39,7 +39,9 @@ Even if you don't have the original `.proto` files, `grpc-dump` will attempt to 
 grpc-dump --port=12345
 
 # in another terminal, run your application pointing it at the proxy
-HTTP_PROXY=localhost:12345 my-app
+# Warning: if your application connects to a localhost/127.0.0.1 address then proxy settings
+# are usually ignored. To fix this you can use a service like https://readme.localtest.me
+http_proxy=http://localhost:12345 my-app
 
 # all the requests made by the application will be logged to standard output in the grpc-dump window e.g.
 # {"service": "echo", "method": "Hi", "messages": ["....."] }
@@ -71,7 +73,7 @@ More details for using `grpc-dump` (including the specification for the JSON out
 grpc-dump --port=12345 > my-app.dump
 
 # in another, run your application pointing it at the proxy
-HTTP_PROXY=localhost:12345 my-app
+http_proxy=http://localhost:12345 my-app
 
 # now run grpc-fixture from the previously saved output
 grpc-fixture --port=12345 --dump=my-app.dump
@@ -79,7 +81,7 @@ grpc-fixture --port=12345 --dump=my-app.dump
 # when running the application again, all requests will
 # be intercepted and answered with saved responses,
 # no requests will be made to the real gRPC server.
-HTTP_PROXY=localhost:12345 my-app
+http_proxy=http://localhost:12345 my-app
 ```
 
 For applications that expect a TLS server, the same `--key` and `--cert` flags can be used as described above for `grpc-dump`.
